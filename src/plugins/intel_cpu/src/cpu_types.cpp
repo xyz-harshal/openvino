@@ -464,6 +464,7 @@ std::string algToString(const Algorithm alg) {
         CASE(EltwiseRoundHalfAwayFromZero);
         CASE(EltwiseErf);
         CASE(EltwiseSoftSign);
+        CASE(EltwiseSoftPlus);
         CASE(EltwiseLog);
         CASE(EltwiseBitwiseAnd);
         CASE(EltwiseBitwiseNot);

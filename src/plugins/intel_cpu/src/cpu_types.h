@@ -205,6 +205,7 @@ enum class Algorithm {
     EltwiseRoundHalfToEven,
     EltwiseRoundHalfAwayFromZero,
     EltwiseErf,
+    EltwiseSoftPlus,
     EltwiseSoftSign,
     EltwiseLog,
     EltwiseBitwiseAnd,

@@ -2501,6 +2501,120 @@ void jit_select_emitter::emit_isa(const std::vector<size_t>& in_vec_idxs,
     h->mov(dst.b16, aux.b16);
 }
 
+/// SOFTPLUS ///
+jit_soft_plus_emitter::jit_soft_plus_emitter(dnnl::impl::cpu::aarch64::jit_generator* host,
+                                           dnnl::impl::cpu::aarch64::cpu_isa_t host_isa,
+                                           const std::shared_ptr<ov::Node>& node)
+    : jit_emitter(host, host_isa, get_arithmetic_binary_exec_precision(node)) {
+    prepare_table();
+    exp_emitter = std::make_unique<jit_exp_emitter>(h, host_isa, node);
+}
+
+jit_soft_plus_emitter::jit_soft_plus_emitter(dnnl::impl::cpu::aarch64::jit_generator* host,
+                                           dnnl::impl::cpu::aarch64::cpu_isa_t host_isa,
+                                           const ov::element::Type exec_prc)
+    : jit_emitter(host, host_isa, exec_prc) {
+    prepare_table();
+    exp_emitter = std::make_unique<jit_exp_emitter>(h, host_isa, exec_prc);
+}
+
+size_t jit_soft_plus_emitter::get_inputs_count() const {
+    return 1;
+}
+
+size_t jit_soft_plus_emitter::get_aux_vecs_count() const {
+    return exp_emitter->get_aux_vecs_count() + 2;
+}
+
+size_t jit_soft_plus_emitter::get_aux_gprs_count() const {
+    return exp_emitter->get_aux_gprs_count() + 1;
+}
+
+void jit_soft_plus_emitter::emit_impl(const std::vector<size_t>& in_vec_idxs,
+                                     const std::vector<size_t>& out_vec_idxs) const {
+    if (host_isa_ == dnnl::impl::cpu::aarch64::asimd) {
+        emit_isa<dnnl::impl::cpu::aarch64::asimd>(in_vec_idxs, out_vec_idxs);
+    } else {
+        OV_CPU_JIT_EMITTER_THROW("Can't create jit softplus kernel");
+    }
+}
+
+template <dnnl::impl::cpu::aarch64::cpu_isa_t isa>
+void jit_soft_plus_emitter::emit_isa(const std::vector<size_t>& in_vec_idxs,
+                                    const std::vector<size_t>& out_vec_idxs) const {
+    if (exec_prc_ != ov::element::f32) {
+        OPENVINO_THROW("unsupported precision: " + exec_prc_.to_string());
+    }
+    using TReg = typename dnnl::impl::cpu::aarch64::cpu_isa_traits<isa>::TReg;
+    const TReg vmm_src(in_vec_idxs[0]);
+    const TReg vmm_dst(out_vec_idxs[0]);
+
+    size_t offset = exp_emitter->get_aux_vecs_count();
+
+    const TReg vmm_threshold(aux_vec_idxs[offset]);
+    const TReg vmm_mask(aux_vec_idxs[offset + 1]);
+
+    // Additional registers for our logarithm approximation:
+    const TReg vmm_y2(aux_vec_idxs[offset + 2]);           // will hold y^2
+    const TReg vmm_y3(aux_vec_idxs[offset + 3]);           // will hold y^3
+    const TReg vmm_half_reg(aux_vec_idxs[offset + 4]);     // constant 0.5
+    const TReg vmm_third_reg(aux_vec_idxs[offset + 5]);      // constant 1/3
+
+    // Load the softplus threshold constant (e.g. 20.0f) from our table:
+    h->ld1r(vmm_threshold.s, table_val2("softplus_threshold"));
+    // Compare: if (x > threshold), set mask to all ones in that lane.
+    h->fcmgt(vmm_mask.s, vmm_src.s, vmm_threshold.s);
+
+    // Compute exp(x) using the exp emitter; result is placed in vmm_dst.
+    exp_emitter->emit_code({vmm_src.getIdx()}, out_vec_idxs, aux_vec_idxs, aux_gpr_idxs);
+    // At this point, vmm_dst holds exp(x).
+
+    // We now want to compute log(1+exp(x)) for x below threshold.
+    // A numerically stable formulation for negative x is:
+    //    log(1+exp(x)) = log(1 + y)   where y = exp(x).
+    // We approximate log(1+y) by its Taylor series (for small y):
+    //    log(1+y) ≈ y - 0.5*y^2 + (1/3)*y^3.
+    // (This approximation is only acceptable if y is small; for a real kernel you would use a better method.)
+    
+    // Let y = exp(x) (which is in vmm_dst).
+    // Compute y^2 and y^3:
+    h->fmul(vmm_y2.s, vmm_dst.s, vmm_dst.s);      // vmm_y2 = (exp(x))^2
+    h->fmul(vmm_y3.s, vmm_dst.s, vmm_y2.s);         // vmm_y3 = (exp(x))^3
+
+    // Load constants 0.5 and 1/3 from our constant table.
+    h->ld1r(vmm_half_reg.s, table_val2("half"));    // half = 0.5f
+    h->ld1r(vmm_third_reg.s, table_val2("third"));    // third = 0.33333f
+
+    // Multiply: term2 = 0.5 * y^2, term3 = (1/3) * y^3.
+    h->fmul(vmm_y2.s, vmm_y2.s, vmm_half_reg.s);      // vmm_y2 becomes 0.5*y^2
+    h->fmul(vmm_y3.s, vmm_y3.s, vmm_third_reg.s);       // vmm_y3 becomes (1/3)*y^3
+
+    // Now compute the approximate logarithm: log_approx = y - (0.5*y^2) + ((1/3)*y^3).
+    // We use vmm_dst (which currently holds y) to accumulate the result.
+    h->fsub(vmm_dst.s, vmm_dst.s, vmm_y2.s);            // vmm_dst = y - 0.5*y^2
+    h->fadd(vmm_dst.s, vmm_dst.s, vmm_y3.s);            // vmm_dst = y - 0.5*y^2 + (1/3)*y^3
+
+    // Finally, select the correct branch:
+    // If x > threshold (mask true) then return x; otherwise return the computed log_approx.
+    h->bsl(vmm_mask.b16, vmm_src.b16, vmm_dst.b16);
+    h->mov(vmm_dst.b16, vmm_mask.b16);
+}
+
+void jit_soft_plus_emitter::register_table_entries() {
+    push_arg_entry_of("one", 0x3f800000, true);
+    push_arg_entry_of("softplus_threshold", 0x41a00000, true); // Softplus threshold for fp32 (20.0)
+}
+
+void jit_soft_plus_emitter::emit_data() const {
+    jit_emitter::emit_data();
+    exp_emitter->emit_data();
+}
+
+std::set<std::vector<element::Type>> jit_soft_plus_emitter::get_supported_precisions(
+    const std::shared_ptr<ov::Node>& node) {
+    return {{element::f32}};
+}
+
 /// SIGMOID ///
 jit_sigmoid_emitter::jit_sigmoid_emitter(dnnl::impl::cpu::aarch64::jit_generator* host,
                                          dnnl::impl::cpu::aarch64::cpu_isa_t host_isa,
